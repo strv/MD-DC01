@@ -159,6 +159,19 @@ static int32_t usart_tx_busy = 0;
 const static int32_t CtrlQ = 8;
 static int32_t target_mv_ = 0;
 
+#if 1
+// normal gain
+volatile static CtrlConfs mt_conf_ =
+{
+  1.f * (1<<CtrlQ),
+  1.0f * (1<<CtrlQ),
+  0.01f * (1<<CtrlQ),
+  300,
+  12000
+};
+#endif
+
+#if 0
 // super high gain for super low velocity
 volatile static CtrlConfs mt_conf_ =
 {
@@ -168,6 +181,7 @@ volatile static CtrlConfs mt_conf_ =
   300,
   12000
 };
+#endif
 
 /* USER CODE END PV */
 
