@@ -55,11 +55,21 @@ extern "C" {
 /* Exported types ------------------------------------------------------------*/
 /* USER CODE BEGIN ET */
 
+typedef struct
+{
+  int32_t v_ff_kp_q8;   // Feed forward P gain
+  int32_t v_kp_q8;      // Feed back P gain
+  int32_t v_ti_q8;      // Feed back I gain
+  int32_t brush_co_mv;  // Brush compensation voltage
+  int32_t max_mv;       // Maximum output voltage
+  int32_t max_cur;      // Maximum output current
+} CtrlConfs;
+
 /* USER CODE END ET */
 
 /* Exported constants --------------------------------------------------------*/
 /* USER CODE BEGIN EC */
-
+const static int32_t CtrlQ = 8;
 /* USER CODE END EC */
 
 /* Exported macro ------------------------------------------------------------*/
