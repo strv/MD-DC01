@@ -112,6 +112,7 @@ static uint16_t adc1_results_[ADC1_BUF_LEN];
 static volatile ADC_GAIN bemf_gain_ = ADC_GAIN_LOW;
 static int32_t cur_raw_ = 0;
 static int32_t cur_raw_zero_ = 0;
+static int32_t cur_ma_ = 0;
 static int32_t bemf_a_raw_ = 0;
 static int32_t bemf_a_high_zero_ = 0;
 static int32_t bemf_a_low_zero_ = 0;
@@ -120,7 +121,8 @@ static int32_t bemf_b_high_zero_ = 0;
 static int32_t bemf_b_low_zero_ = 0;
 static int32_t bemf_mv_ = 0;
 static int32_t vref_raw_ = 0;
-static int32_t vm_raw_ = 0;
+static int32_t v_dclink_raw_ = 0;
+static int32_t v_dclink_mv_ = 0;
 static int32_t pwm_oc_ = 0;
 static int32_t adc_aux0_ = 0;
 static int32_t adc_aux1_ = 0;
@@ -142,6 +144,8 @@ static int32_t oc_ = 0;
 
 // Control
 static int32_t target_mv_ = 0;
+static int32_t vout_lim_ = 0;
+static int32_t v_i_sum_ = 0;
 
 static const CtrlConfs * p_mt_conf_ = &MtConfDefault;
 
@@ -174,6 +178,7 @@ void pwm_init();
 void pwm_set_duty(const int32_t rate_q15);
 void pwm_enable();
 void pwm_disable();
+void update_params();
 /* USER CODE END PFP */
 
 /* Private user code ---------------------------------------------------------*/
@@ -210,8 +215,8 @@ void adc_cb()
 {
   vref_raw_ = (((int32_t)adc1_results_[ADC1_CH_VREF] << AdcExtQ) * AdcLpfFo
                 + vref_raw_ * AdcLpf1_Fo) >> AdcLpfQ;
-  vm_raw_ = (((int32_t)adc1_results_[ADC1_CH_VM] << AdcExtQ) * AdcLpfFo
-                + vm_raw_ * AdcLpf1_Fo) >> AdcLpfQ;
+  v_dclink_raw_ = (((int32_t)adc1_results_[ADC1_CH_VM] << AdcExtQ) * AdcLpfFo
+                + v_dclink_raw_ * AdcLpf1_Fo) >> AdcLpfQ;
   cur_raw_ = ((((int32_t)adc1_results_[ADC1_CH_CUR] << AdcExtQ) - cur_raw_zero_) * AdcCurLpfFo
                 + cur_raw_ * AdcCurLpf1_Fo) >> AdcCurLpfQ;
   adc_aux0_ = ((int32_t)adc1_results_[ADC1_CH_AUX0] * AdcLpfFo
@@ -304,7 +309,7 @@ void adc_update_params(const int pwm_oc)
 
 int adc_get_vm()
 {
-  return (int64_t)vm_raw_ * AdcVrefMv * 11 / vref_raw_;
+  return (int64_t)v_dclink_raw_ * AdcVrefMv * 11 / vref_raw_;
 }
 
 int adc_get_cur()
@@ -368,10 +373,10 @@ void pwm_set_duty(const int32_t rate_q15)
   else if (oc_ <= -PWM_CYCLE) oc_ = -(PWM_CYCLE - 1);
 }
 
-void pwm_set_mv(const int32_t mv, const int32_t vm)
+void pwm_set_mv(const int32_t mv)
 {
   int32_t duty = 0;
-  duty = (int64_t)mv * (1<<15) * BemfMeasureCycle / (vm * BemfDriveDuration);
+  duty = (int64_t)mv * (1<<15) * BemfMeasureCycle / (v_dclink_mv_ * BemfDriveDuration);
   pwm_set_duty(duty);
 }
 
@@ -386,7 +391,15 @@ void pwm_disable()
   output_open();
 }
 
-static int v_i_sum = 0;
+void update_params()
+{
+  cur_ma_ = adc_get_cur();
+  bemf_mv_ = adc_get_bemf();
+  v_dclink_mv_ = adc_get_vm();
+  vout_lim_ = v_dclink_mv_ * BemfDriveDuration / BemfMeasureCycle;
+  if (vout_lim_ > p_mt_conf_->max_mv) vout_lim_ = p_mt_conf_->max_mv;
+}
+
 void pwm_cb()
 {
   bemf_meas_cnt_++;
@@ -400,36 +413,33 @@ void pwm_cb()
       const int32_t err = target_mv_ - bemf_mv_;
       int32_t vout;
       int32_t vout_tmp;
-      const int32_t vm = adc_get_vm();
-      int32_t vout_lim = vm * BemfDriveDuration / BemfMeasureCycle;
-      if (vout_lim > mt_conf_.max_mv) vout_lim = mt_conf_.max_mv;
 
-      v_i_sum += err;
+      v_i_sum_ += err;
 
       // feedforward
-      vout = (target_mv_ * mt_conf_.v_ff_kp_q8) >> CtrlQ;
+      vout = (target_mv_ * (p_mt_conf_->v_ff_kp_q8)) >> CtrlQ;
 
       // feedback
-      vout += (int64_t)(err * mt_conf_.v_kp_q8 + v_i_sum * mt_conf_.v_ti_q8) >> CtrlQ;
+      vout += ((int64_t)err * (p_mt_conf_->v_kp_q8) + (int64_t)v_i_sum_ * (p_mt_conf_->v_ti_q8)) >> CtrlQ;
 
       // compensate brush voltage drop
-      if (vout > 0) vout += mt_conf_.brush_co_mv;
-      else if (vout < 0) vout -= mt_conf_.brush_co_mv;
+      if (vout > 0) vout += p_mt_conf_->brush_co_mv;
+      else if (vout < 0) vout -= p_mt_conf_->brush_co_mv;
 
       vout_tmp = vout;
 
       // limit output
-      if (vout > vout_lim) vout = vout_lim;
-      else if (vout < -vout_lim) vout = -vout_lim;
+      if (vout > vout_lim_) vout = vout_lim_;
+      else if (vout < -vout_lim_) vout = -vout_lim_;
 
       // unti windup
       if ((vout < vout_tmp && err > 0)
           || (vout > vout_tmp && err < 0))
       {
-        v_i_sum -= err;
+        v_i_sum_ -= err;
       }
 
-      pwm_set_mv(vout, vm);
+      pwm_set_mv(vout);
     }
     if (enable_output_)
       set_oc();
@@ -460,11 +470,9 @@ int sw_is_pressed()
   */
 int main(void)
 {
+
   /* USER CODE BEGIN 1 */
   char report_buf[256];
-  int vm_mv;
-  int cur_ma;
-  int bemf_mv;
   /* USER CODE END 1 */
 
   /* MCU Configuration--------------------------------------------------------*/
@@ -513,9 +521,7 @@ int main(void)
   {
     if (sw_is_pressed())
       pwm_disable();
-    vm_mv = adc_get_vm();
-    cur_ma = adc_get_cur();
-    bemf_mv = adc_get_bemf();
+    update_params();
     /* USER CODE END WHILE */
 
     /* USER CODE BEGIN 3 */
@@ -557,11 +563,14 @@ int main(void)
 
       #if 1
       mode_ = CTRL_VEL;
-      int target = (adc_aux0_ - 32768) * 1500 / 32768;
-      const int db = 50;
+      int target = (adc_aux0_ - 32768) * 500 / 32768;
+      const int db = 10;
       if (target > db) target -= db;
       else if (target < -db) target += db;
       else target = 0;
+      if (target == 0) led_on(3);
+      else led_off(3);
+
       target_mv_ = target;
       if (absi(target) < 16000/10) adc_set_gain(ADC_GAIN_HIGH);
       else adc_set_gain(ADC_GAIN_LOW);
@@ -575,7 +584,7 @@ int main(void)
       report_ms_prev_ += ReportIntervalMs;
 
       xsprintf(report_buf, "%7d %1d %5d %5d %6d %5d\n",
-                ms_, state_, vm_mv, cur_ma, bemf_mv, target_mv_);
+                ms_, state_, v_dclink_mv_, cur_ma_, bemf_mv_, target_mv_);
       int len = 0;
       while(report_buf[len++] != '\0');
       usart_tx(report_buf, len);
@@ -749,7 +758,7 @@ static void MX_ADC1_Init(void)
   LL_ADC_REG_Init(ADC1, &ADC_REG_InitStruct);
   LL_ADC_SetOverSamplingScope(ADC1, LL_ADC_OVS_DISABLE);
   LL_ADC_SetTriggerFrequencyMode(ADC1, LL_ADC_CLOCK_FREQ_MODE_HIGH);
-  LL_ADC_SetCommonPathInternalCh(__LL_ADC_COMMON_INSTANCE(ADC1), LL_ADC_AWD_CH_VREFINT_REG);
+  LL_ADC_SetCommonPathInternalCh(__LL_ADC_COMMON_INSTANCE(ADC1), LL_ADC_PATH_INTERNAL_VREFINT);
   LL_ADC_SetSamplingTimeCommonChannels(ADC1, LL_ADC_SAMPLINGTIME_COMMON_1, LL_ADC_SAMPLINGTIME_79CYCLES_5);
   LL_ADC_SetSamplingTimeCommonChannels(ADC1, LL_ADC_SAMPLINGTIME_COMMON_2, LL_ADC_SAMPLINGTIME_160CYCLES_5);
   LL_ADC_DisableIT_EOC(ADC1);
@@ -763,7 +772,7 @@ static void MX_ADC1_Init(void)
    /* CPU processing cycles (depends on compilation optimization). */
    /* Note: If system core clock frequency is below 200kHz, wait time */
    /* is only a few CPU processing cycles. */
-   uint32_t wait_loop_index;
+   __IO uint32_t wait_loop_index;
    wait_loop_index = ((LL_ADC_DELAY_INTERNAL_REGUL_STAB_US * (SystemCoreClock / (100000 * 2))) / 10);
    while(wait_loop_index != 0)
      {
@@ -1037,7 +1046,7 @@ static void MX_I2C1_Init(void)
   /** I2C Initialization
   */
   I2C_InitStruct.PeripheralMode = LL_I2C_MODE_I2C;
-  I2C_InitStruct.Timing = 0x10707DBC;
+  I2C_InitStruct.Timing = 0x10B17DB5;
   I2C_InitStruct.AnalogFilter = LL_I2C_ANALOGFILTER_ENABLE;
   I2C_InitStruct.DigitalFilter = 0;
   I2C_InitStruct.OwnAddress1 = 0;
@@ -1342,8 +1351,8 @@ static void MX_DMA_Init(void)
 static void MX_GPIO_Init(void)
 {
   LL_GPIO_InitTypeDef GPIO_InitStruct = {0};
-/* USER CODE BEGIN MX_GPIO_Init_1 */
-/* USER CODE END MX_GPIO_Init_1 */
+  /* USER CODE BEGIN MX_GPIO_Init_1 */
+  /* USER CODE END MX_GPIO_Init_1 */
 
   /* GPIO Ports Clock Enable */
   LL_IOP_GRP1_EnableClock(LL_IOP_GRP1_PERIPH_GPIOB);
@@ -1448,8 +1457,8 @@ static void MX_GPIO_Init(void)
   GPIO_InitStruct.Pull = LL_GPIO_PULL_NO;
   LL_GPIO_Init(ENC_Z_GPIO_Port, &GPIO_InitStruct);
 
-/* USER CODE BEGIN MX_GPIO_Init_2 */
-/* USER CODE END MX_GPIO_Init_2 */
+  /* USER CODE BEGIN MX_GPIO_Init_2 */
+  /* USER CODE END MX_GPIO_Init_2 */
 }
 
 /* USER CODE BEGIN 4 */
@@ -1470,8 +1479,7 @@ void Error_Handler(void)
   }
   /* USER CODE END Error_Handler_Debug */
 }
-
-#ifdef  USE_FULL_ASSERT
+#ifdef USE_FULL_ASSERT
 /**
   * @brief  Reports the name of the source file and the source line number
   *         where the assert_param error has occurred.
