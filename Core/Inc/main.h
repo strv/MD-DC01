@@ -60,6 +60,7 @@ typedef struct
   int32_t v_ff_kp_q8;   // Feed forward P gain
   int32_t v_kp_q8;      // Feed back P gain
   int32_t v_ti_q8;      // Feed back I gain
+  int32_t v_gain_schedule_multiplier; // Gain multiplier
   int32_t brush_co_mv;  // Brush compensation voltage
   int32_t max_mv;       // Maximum output voltage
   int32_t max_cur;      // Maximum output current
