@@ -22,6 +22,11 @@
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
 #include "xprintf.h"
+
+#include "led.h"
+#include "motor_profiles.h"
+#include "usart.h"
+#include <stdint.h>
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
@@ -59,15 +64,6 @@ typedef enum
   CTRL_POS
 } CTRL_MODE;
 
-typedef struct
-{
-  int32_t v_ff_kp_q8;
-  int32_t v_kp_q8;
-  int32_t v_ti_q8;
-  int32_t brush_co_mv;
-  int32_t max_mv;
-} CtrlConfs;
-
 /* USER CODE END PTD */
 
 /* Private define ------------------------------------------------------------*/
@@ -75,9 +71,6 @@ typedef struct
 #define ADC1_SUM_NUM (1)
 #define ADC1_BUF_LEN (ADC1_CH_NUM * ADC1_SUM_NUM)
 
-#define UART_RX_BUF_LEN (1 << 8)
-#define UART_DMA DMA1
-#define UART_RX_BUF_MASK (UART_RX_BUF_LEN - 1)
 /* USER CODE END PD */
 
 /* Private macro -------------------------------------------------------------*/
@@ -147,41 +140,10 @@ static int32_t bemf_meas_start_ = BemfMeasureCycle - BemfMeasureDuration + BemfM
 static int32_t bemf_meas_end_ = BemfMeasureCycle - 1;
 static int32_t oc_ = 0;
 
-// USART
-static char usart_rx_buf[UART_RX_BUF_LEN];
-static int32_t usart_rx_wp = 0;
-static int32_t usart_rx_rp = 0;
-static int32_t usart_error = 0;
-static int32_t usart_rx_nl = 0;
-static int32_t usart_tx_busy = 0;
-
 // Control
-const static int32_t CtrlQ = 8;
 static int32_t target_mv_ = 0;
 
-#if 1
-// normal gain
-volatile static CtrlConfs mt_conf_ =
-{
-  1.f * (1<<CtrlQ),
-  1.0f * (1<<CtrlQ),
-  0.01f * (1<<CtrlQ),
-  300,
-  12000
-};
-#endif
-
-#if 0
-// super high gain for super low velocity
-volatile static CtrlConfs mt_conf_ =
-{
-  1.f * (1<<CtrlQ),
-  10.0f * (1<<CtrlQ),
-  10.1f * (1<<CtrlQ),
-  300,
-  12000
-};
-#endif
+static const CtrlConfs * p_mt_conf_ = &MtConfDefault;
 
 /* USER CODE END PV */
 
@@ -196,6 +158,7 @@ static void MX_TIM1_Init(void);
 static void MX_TIM3_Init(void);
 static void MX_USART1_UART_Init(void);
 /* USER CODE BEGIN PFP */
+int absi(const int i);
 void adc_init();
 void adc_set_gain(const ADC_GAIN g);
 void adc_enable_zero_update();
@@ -211,16 +174,11 @@ void pwm_init();
 void pwm_set_duty(const int32_t rate_q15);
 void pwm_enable();
 void pwm_disable();
-void usart_init(void);
-int usart_tx(const char* str, const int len);
-void usart_update_nl(void);
-int usart_readline(char* str, const int len);
-bool usart_is_tx_busy(void);
 /* USER CODE END PFP */
 
 /* Private user code ---------------------------------------------------------*/
 /* USER CODE BEGIN 0 */
-int absi(int i)
+int absi(const int i)
 {
   return i < 0 ? -i : i;
 }
@@ -485,169 +443,6 @@ void pwm_cb()
   {
     adc_enable_bemf_update();
   }
-}
-
-void usart_init(void)
-{
-  LL_USART_ClearFlag_UDR(UART);
-  LL_USART_ClearFlag_TC(UART);
-  LL_USART_EnableDirectionRx(UART);
-  LL_USART_EnableDirectionTx(UART);
-  LL_USART_EnableDMAReq_TX(UART);
-  LL_USART_EnableIT_RXNE(UART);
-
-  LL_DMA_DisableChannel(UART_DMA, UART_DMA_TX_CH);
-  LL_DMA_SetPeriphAddress(UART_DMA, UART_DMA_TX_CH,
-                          LL_USART_DMA_GetRegAddr(UART, LL_USART_DMA_REG_DATA_TRANSMIT));
-  LL_DMA_EnableIT_TC(UART_DMA, UART_DMA_TX_CH);
-
-  LL_USART_Enable(UART);
-}
-
-int usart_tx(const char* str, const int len)
-{
-  if (usart_tx_busy)
-  {
-    return -1;
-  }
-  LL_DMA_DisableChannel(UART_DMA, UART_DMA_TX_CH);
-  LL_DMA_SetDataLength(UART_DMA, UART_DMA_TX_CH, len);
-  LL_DMA_SetMemoryAddress(UART_DMA, UART_DMA_TX_CH, (uint32_t)str);
-  LL_DMA_EnableChannel(UART_DMA, UART_DMA_TX_CH);
-  usart_tx_busy = 1;
-  return 0;
-}
-
-void usart_update_nl(void)
-{
-  int nl = 0;
-  char c_prev = '\0';
-  for (uint32_t i = usart_rx_rp; i != usart_rx_wp; i = (i+1) & UART_RX_BUF_MASK)
-  {
-    if (usart_rx_buf[i] == '\n')
-    {
-      if (c_prev != '\r')
-      {
-        nl++;
-      }
-      c_prev = usart_rx_buf[i];
-      usart_rx_buf[i] = '\0';
-    }
-    else if (usart_rx_buf[i] == '\r')
-    {
-      nl++;
-      c_prev = usart_rx_buf[i];
-      usart_rx_buf[i] = '\0';
-    }
-    else
-    {
-      c_prev = usart_rx_buf[i];
-    }
-  }
-  usart_rx_nl = nl;
-}
-
-int usart_readline(char* str, const int len)
-{
-  usart_update_nl();
-  if (usart_rx_nl == 0)
-  {
-    return 0;
-  }
-  char c;
-  for (int i = 0; i < len && usart_rx_rp != usart_rx_wp ; ++i)
-  {
-    c = usart_rx_buf[usart_rx_rp++];
-    usart_rx_rp &= UART_RX_BUF_MASK;
-    str[i] = c;
-    if (c == '\0')
-    {
-      break;
-    }
-  }
-  return len;
-}
-
-inline bool usart_is_tx_busy(void)
-{
-  return usart_tx_busy;
-}
-
-void usart_rx_cb(void)
-{
-  usart_rx_buf[usart_rx_wp] = LL_USART_ReceiveData8(UART);
-  usart_rx_wp = (usart_rx_wp + 1) & UART_RX_BUF_MASK;
-  if (usart_rx_wp == usart_rx_rp)
-  {
-    ++usart_rx_rp;
-    usart_error |= 0x0001;
-  }
-}
-
-void usart_tx_cb(void)
-{
-  usart_tx_busy = 0;
-}
-
-void led_on(const int num)
-{
-  switch (num)
-  {
-  case 0:
-    LL_GPIO_SetOutputPin(LED0_GPIO_Port, LED0_Pin);
-    break;
-  case 1:
-    LL_GPIO_SetOutputPin(LED1_GPIO_Port, LED1_Pin);
-    break;
-  case 2:
-    LL_GPIO_SetOutputPin(LED2_GPIO_Port, LED2_Pin);
-    break;
-  case 3:
-    LL_GPIO_SetOutputPin(LED3_GPIO_Port, LED3_Pin);
-    break;
-  }
-}
-
-void led_off(const int num)
-{
-  switch (num)
-  {
-  case 0:
-    LL_GPIO_ResetOutputPin(LED0_GPIO_Port, LED0_Pin);
-    break;
-  case 1:
-    LL_GPIO_ResetOutputPin(LED1_GPIO_Port, LED1_Pin);
-    break;
-  case 2:
-    LL_GPIO_ResetOutputPin(LED2_GPIO_Port, LED2_Pin);
-    break;
-  case 3:
-    LL_GPIO_ResetOutputPin(LED3_GPIO_Port, LED3_Pin);
-    break;
-  }
-}
-
-void led_set(const int bits, const int mask)
-{
-  if ((mask & 0x01) && (bits & 0x01))
-    LL_GPIO_SetOutputPin(LED0_GPIO_Port, LED0_Pin);
-  else if (mask & 0x01)
-    LL_GPIO_ResetOutputPin(LED0_GPIO_Port, LED0_Pin);
-
-  if ((mask & 0x02) && (bits & 0x02))
-    LL_GPIO_SetOutputPin(LED1_GPIO_Port, LED1_Pin);
-  else if (mask & 0x02)
-    LL_GPIO_ResetOutputPin(LED1_GPIO_Port, LED1_Pin);
-
-  if ((mask & 0x04) && (bits & 0x04))
-    LL_GPIO_SetOutputPin(LED2_GPIO_Port, LED2_Pin);
-  else if (mask & 0x04)
-    LL_GPIO_ResetOutputPin(LED2_GPIO_Port, LED2_Pin);
-
-  if ((mask & 0x08) && (bits & 0x08))
-    LL_GPIO_SetOutputPin(LED3_GPIO_Port, LED3_Pin);
-  else if (mask & 0x08)
-    LL_GPIO_ResetOutputPin(LED3_GPIO_Port, LED3_Pin);
 }
 
 /*
