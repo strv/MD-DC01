@@ -147,6 +147,10 @@ static int32_t target_mv_ = 0;
 static int32_t vout_lim_ = 0;
 static int32_t v_i_sum_ = 0;
 
+const static int32_t CtrlGainQ = 4;
+static int32_t gain_multiplier_q4_ = 0;
+static int32_t gain_scheduled_q4_ = 0;
+
 static const CtrlConfs * p_mt_conf_ = &MtConfDefault;
 
 /* USER CODE END PV */
@@ -410,6 +414,7 @@ void pwm_cb()
 
     if (mode_ != CTRL_VOLT)
     {
+      led_on(0);
       const int32_t err = target_mv_ - bemf_mv_;
       int32_t vout;
       int32_t vout_tmp;
@@ -420,7 +425,11 @@ void pwm_cb()
       vout = (target_mv_ * (p_mt_conf_->v_ff_kp_q8)) >> CtrlQ;
 
       // feedback
-      vout += ((int64_t)err * (p_mt_conf_->v_kp_q8) + (int64_t)v_i_sum_ * (p_mt_conf_->v_ti_q8)) >> CtrlQ;
+      const int32_t fb = ((int64_t)err * (p_mt_conf_->v_kp_q8)
+                          + (int64_t)v_i_sum_ * (p_mt_conf_->v_ti_q8))
+                          >> CtrlQ;
+
+      vout += (fb * gain_scheduled_q4_) >> CtrlGainQ;
 
       // compensate brush voltage drop
       if (vout > 0) vout += p_mt_conf_->brush_co_mv;
@@ -440,6 +449,7 @@ void pwm_cb()
       }
 
       pwm_set_mv(vout);
+      led_off(0);
     }
     if (enable_output_)
       set_oc();
@@ -517,6 +527,8 @@ int main(void)
   /* Infinite loop */
   /* USER CODE BEGIN WHILE */
   adc_set_gain(ADC_GAIN_LOW);
+  gain_multiplier_q4_ = (p_mt_conf_->v_gain_schedule_multiplier) << CtrlGainQ;
+  gain_scheduled_q4_ = gain_multiplier_q4_;
   while (1)
   {
     if (sw_is_pressed())
@@ -563,7 +575,7 @@ int main(void)
 
       #if 1
       mode_ = CTRL_VEL;
-      int target = (adc_aux0_ - 32768) * 500 / 32768;
+      int target = (adc_aux0_ - 32768) * (p_mt_conf_->max_mv) / 32768;
       const int db = 10;
       if (target > db) target -= db;
       else if (target < -db) target += db;
@@ -571,9 +583,12 @@ int main(void)
       if (target == 0) led_on(3);
       else led_off(3);
 
-      target_mv_ = target;
       if (absi(target) < 16000/10) adc_set_gain(ADC_GAIN_HIGH);
       else adc_set_gain(ADC_GAIN_LOW);
+
+      target_mv_ = target;
+
+      gain_scheduled_q4_ = (1<<CtrlGainQ) + gain_multiplier_q4_ * (p_mt_conf_->max_mv - absi(target_mv_))/(p_mt_conf_->max_mv);
       #endif
     }
       break;
