@@ -146,6 +146,11 @@ static int32_t oc_ = 0;
 static int32_t target_mv_ = 0;
 static int32_t vout_lim_ = 0;
 static int32_t v_i_sum_ = 0;
+static int32_t vout_mv_ = 0;
+const static int32_t ZeroHoldDeadBandMv = 5;
+const static int32_t ZeroHoldEnterCycles = 20; // 50 ms at the 2.5 ms control period
+static int32_t zero_target_cycles_ = 0;
+static bool zero_hold_prev_ = false;
 
 const static int32_t CtrlGainQ = 4;
 static int32_t gain_multiplier_q4_ = 0;
@@ -415,9 +420,25 @@ void pwm_cb()
     if (mode_ != CTRL_VOLT)
     {
       led_on(0);
-      const int32_t err = target_mv_ - bemf_mv_;
+      // A target that only touches 0 at very low speed must not reset the integrator.
+      if (target_mv_ != 0) zero_target_cycles_ = 0;
+      else if (zero_target_cycles_ < ZeroHoldEnterCycles) zero_target_cycles_++;
+      const bool zero_hold = (zero_target_cycles_ >= ZeroHoldEnterCycles);
+      int32_t err = target_mv_ - bemf_mv_;
       int32_t vout;
       int32_t vout_tmp;
+
+      // The integral built while running would keep driving a slow rotation that BEMF cannot detect.
+      if (zero_hold && !zero_hold_prev_) v_i_sum_ = 0;
+      zero_hold_prev_ = zero_hold;
+
+      // Inside the band err is 0, so the integrator keeps the torque holding against cogging.
+      if (zero_hold)
+      {
+        if (err > ZeroHoldDeadBandMv) err -= ZeroHoldDeadBandMv;
+        else if (err < -ZeroHoldDeadBandMv) err += ZeroHoldDeadBandMv;
+        else err = 0;
+      }
 
       v_i_sum_ += err;
 
@@ -432,8 +453,12 @@ void pwm_cb()
       vout += (fb * gain_scheduled_q4_) >> CtrlGainQ;
 
       // compensate brush voltage drop
-      if (vout > 0) vout += p_mt_conf_->brush_co_mv;
-      else if (vout < 0) vout -= p_mt_conf_->brush_co_mv;
+      // Skipped at zero target: the step at vout = 0 would flip the output by +-brush_co_mv.
+      if (!zero_hold)
+      {
+        if (vout > 0) vout += p_mt_conf_->brush_co_mv;
+        else if (vout < 0) vout -= p_mt_conf_->brush_co_mv;
+      }
 
       vout_tmp = vout;
 
@@ -448,6 +473,7 @@ void pwm_cb()
         v_i_sum_ -= err;
       }
 
+      vout_mv_ = vout;
       pwm_set_mv(vout);
       led_off(0);
     }
@@ -576,12 +602,12 @@ int main(void)
       #if 1
       mode_ = CTRL_VEL;
       int target = (adc_aux0_ - 32768) * (p_mt_conf_->max_mv) / 32768;
-      const int db = 10;
+      const int db = 30;
       if (target > db) target -= db;
       else if (target < -db) target += db;
       else target = 0;
-      if (target == 0) led_on(3);
-      else led_off(3);
+      if (target == 0) led_off(3);
+      else led_on(3);
 
       if (absi(target) < 16000/10) adc_set_gain(ADC_GAIN_HIGH);
       else adc_set_gain(ADC_GAIN_LOW);
@@ -598,8 +624,8 @@ int main(void)
     {
       report_ms_prev_ += ReportIntervalMs;
 
-      xsprintf(report_buf, "%7d %1d %5d %5d %6d %5d\n",
-                ms_, state_, v_dclink_mv_, cur_ma_, bemf_mv_, target_mv_);
+      xsprintf(report_buf, "%7d %1d %5d %5d %6d %5d %6d %8d\n",
+                ms_, state_, v_dclink_mv_, cur_ma_, bemf_mv_, target_mv_, vout_mv_, v_i_sum_);
       int len = 0;
       while(report_buf[len++] != '\0');
       usart_tx(report_buf, len);
