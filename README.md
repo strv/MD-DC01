@@ -45,9 +45,9 @@ DCブラシモータをセンサレス速度制御することが可能なモー
 # 開発環境
 
 - STM32CubeMX
-  - 6.9.2 or Higher
-- STM32Cube MCU Package for STM32F0 Series
-  - 1.6.1
+  - 6.18.1 or Higher
+- STM32Cube MCU Package for STM32G0 Series
+  - 1.6.3
 
 ## 動作確認環境
 
