@@ -93,10 +93,6 @@ static CTRL_MODE mode_ = CTRL_VOLT;
 
 // ADC
 const static int32_t AdcExtQ = 4;
-const static int32_t AdcCurLpfQ = 4;
-const static int32_t AdcCurLpfFo = 1;
-const static int32_t AdcCurLpfDnm = 1 << AdcCurLpfQ;
-const static int32_t AdcCurLpf1_Fo = AdcCurLpfDnm - AdcCurLpfFo;
 const static int32_t AdcBemfLpfQ = 0;
 const static int32_t AdcBemfLpfFo = 1;
 const static int32_t AdcBemfLpfDnm = 1 << AdcBemfLpfQ;
@@ -110,8 +106,10 @@ const static int32_t BemfDeadBandRaw = 32;
 
 static uint16_t adc1_results_[ADC1_BUF_LEN];
 static volatile ADC_GAIN bemf_gain_ = ADC_GAIN_LOW;
-static int32_t cur_raw_ = 0;
 static int32_t cur_raw_zero_ = 0;
+static int32_t cur_sum_raw_ = 0;
+static int32_t cur_sum_num_ = 0;
+static bool do_cur_meas_ = false;
 static int32_t cur_ma_ = 0;
 static int32_t bemf_a_raw_ = 0;
 static int32_t bemf_a_high_zero_ = 0;
@@ -123,7 +121,6 @@ static int32_t bemf_mv_ = 0;
 static int32_t vref_raw_ = 0;
 static int32_t v_dclink_raw_ = 0;
 static int32_t v_dclink_mv_ = 0;
-static int32_t pwm_oc_ = 0;
 static int32_t adc_aux0_ = 0;
 static int32_t adc_aux1_ = 0;
 static bool zero_update_ = false;
@@ -179,9 +176,8 @@ void adc_disable_zero_update();
 void adc_enable_bemf_update();
 void adc_disable_bemf_update();
 void adc_update_bemf();
-void adc_update_params(const int pwm_rate);
+void adc_latch_cur(const int32_t pwm_oc);
 int adc_get_vm();
-int adc_get_cur();
 int adc_get_bemf();
 void pwm_init();
 void pwm_set_duty(const int32_t rate_q15);
@@ -226,15 +222,19 @@ void adc_cb()
                 + vref_raw_ * AdcLpf1_Fo) >> AdcLpfQ;
   v_dclink_raw_ = (((int32_t)adc1_results_[ADC1_CH_VM] << AdcExtQ) * AdcLpfFo
                 + v_dclink_raw_ * AdcLpf1_Fo) >> AdcLpfQ;
-  cur_raw_ = ((((int32_t)adc1_results_[ADC1_CH_CUR] << AdcExtQ) - cur_raw_zero_) * AdcCurLpfFo
-                + cur_raw_ * AdcCurLpf1_Fo) >> AdcCurLpfQ;
+  const int32_t cur_ext = (int32_t)adc1_results_[ADC1_CH_CUR] << AdcExtQ;
+  if (do_cur_meas_)
+  {
+    cur_sum_raw_ += cur_ext - cur_raw_zero_;
+    cur_sum_num_++;
+  }
   adc_aux0_ = ((int32_t)adc1_results_[ADC1_CH_AUX0] * AdcLpfFo
                 + adc_aux0_ * AdcLpf1_Fo) >> AdcLpfQ;
   adc_aux1_ = ((int32_t)adc1_results_[ADC1_CH_AUX1] * AdcLpfFo
                 + adc_aux1_ * AdcLpf1_Fo) >> AdcLpfQ;
   if (zero_update_)
   {
-    cur_raw_zero_ = (cur_raw_ * AdcLpfFo
+    cur_raw_zero_ = (cur_ext * AdcLpfFo
                     + cur_raw_zero_ * AdcLpf1_Fo) >> AdcLpfQ;
     if (bemf_gain_ == ADC_GAIN_HIGH)
     {
@@ -311,24 +311,25 @@ void adc_update_bemf()
   bemf_mv_ = (bemf_mv_raw * AdcBemfLpfFo + bemf_mv_ * AdcBemfLpf1_Fo) >> AdcBemfLpfQ;
 }
 
-void adc_update_params(const int pwm_oc)
+// The shunt only carries current during the on-time, so the drive period mean is divided by the duty.
+void adc_latch_cur(const int32_t pwm_oc)
 {
-  pwm_oc_ = pwm_oc;
+  do_cur_meas_ = false;
+  int32_t ma = 0;
+  if (absi(pwm_oc) >= 6)
+  {
+    const int32_t mean_raw = cur_sum_raw_ / cur_sum_num_;
+    if (mean_raw > 0)
+    {
+      ma = (int64_t)mean_raw * AdcVrefMv * 50 * PWM_CYCLE / ((int64_t)vref_raw_ * 51 * absi(pwm_oc));
+    }
+  }
+  cur_ma_ = pwm_oc < 0 ? -ma : ma;
 }
 
 int adc_get_vm()
 {
   return (int64_t)v_dclink_raw_ * AdcVrefMv * 11 / vref_raw_;
-}
-
-int adc_get_cur()
-{
-  int ma = (int64_t)cur_raw_ * AdcVrefMv * 50 / (vref_raw_ * 51);
-  if (absi(pwm_oc_) < 6)
-    ma = 0;
-  else
-    ma = ma * PWM_CYCLE / pwm_oc_;
-  return ma;
 }
 
 int adc_get_bemf()
@@ -402,11 +403,12 @@ void pwm_disable()
 
 void update_params()
 {
-  cur_ma_ = adc_get_cur();
   bemf_mv_ = adc_get_bemf();
   v_dclink_mv_ = adc_get_vm();
-  vout_lim_ = v_dclink_mv_ * BemfDriveDuration / BemfMeasureCycle;
-  if (vout_lim_ > p_mt_conf_->max_mv) vout_lim_ = p_mt_conf_->max_mv;
+  // pwm_cb reads vout_lim_, so it must never hold the value before clamping.
+  int32_t vout_lim = v_dclink_mv_ * BemfDriveDuration / BemfMeasureCycle;
+  if (vout_lim > p_mt_conf_->max_mv) vout_lim = p_mt_conf_->max_mv;
+  vout_lim_ = vout_lim;
 }
 
 void pwm_cb()
@@ -466,6 +468,9 @@ void pwm_cb()
       if (vout > vout_lim_) vout = vout_lim_;
       else if (vout < -vout_lim_) vout = -vout_lim_;
 
+      // cut output while over the current limit
+      if (absi(cur_ma_) > p_mt_conf_->max_cur) vout = 0;
+
       // unti windup
       if ((vout < vout_tmp && err > 0)
           || (vout > vout_tmp && err < 0))
@@ -479,11 +484,14 @@ void pwm_cb()
     }
     if (enable_output_)
       set_oc();
+    cur_sum_raw_ = 0;
+    cur_sum_num_ = 0;
+    do_cur_meas_ = true;
   }
   else if (bemf_meas_cnt_ == bemf_meas_outoff_)
   {
     output_open();
-    adc_update_params(oc_);
+    adc_latch_cur(oc_);
   }
   else if (bemf_meas_cnt_ == bemf_meas_start_)
   {
