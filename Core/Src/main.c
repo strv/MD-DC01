@@ -93,10 +93,6 @@ static CTRL_MODE mode_ = CTRL_VOLT;
 
 // ADC
 const static int32_t AdcExtQ = 4;
-const static int32_t AdcBemfLpfQ = 0;
-const static int32_t AdcBemfLpfFo = 1;
-const static int32_t AdcBemfLpfDnm = 1 << AdcBemfLpfQ;
-const static int32_t AdcBemfLpf1_Fo = AdcBemfLpfDnm - AdcBemfLpfFo;
 const static int32_t AdcLpfQ = 4;
 const static int32_t AdcLpfFo = 1;
 const static int32_t AdcLpfDnm = 1 << AdcLpfQ;
@@ -150,10 +146,32 @@ static int32_t zero_target_cycles_ = 0;
 static bool zero_hold_prev_ = false;
 
 const static int32_t CtrlGainQ = 4;
+const static int32_t GainKneeMv = 300;
+const static int32_t GainExtra = 10;         // on top of the schedule at very low speed
+const static int32_t GainExtraKneeMv = 20;
+const static int32_t IntegralGainMinQ4 = 32; // integral stays usable above the knee. Higher feels springy
+const static int32_t IntegralClampMv = 200;  // largest error integrated per cycle
+const static int32_t BemfSpikeMv = 50;
+const static int32_t TargetRampMv = 10;      // per control cycle
+static int32_t gain_prev_q4_ = 0;
+static int32_t bemf_sum_mv_ = 0;
+static int32_t bemf_sum_num_ = 0;
+static int32_t target_ref_mv_ = 0;
+static int32_t bemf_prev_mv_ = 0;
+static bool bemf_held_ = false;
 static int32_t gain_multiplier_q4_ = 0;
 static int32_t gain_scheduled_q4_ = 0;
 
 static const CtrlConfs * p_mt_conf_ = &MtConfDefault;
+
+// Watchdog
+static volatile uint32_t pwm_cb_cnt_ = 0;
+
+// PC command
+const static uint32_t PcTargetTimeoutMs = 500;
+static bool pc_mode_ = false;
+static int32_t pc_target_mv_ = 0;
+static uint32_t pc_target_ms_ = 0;
 
 /* USER CODE END PV */
 
@@ -167,6 +185,7 @@ static void MX_I2C1_Init(void);
 static void MX_TIM1_Init(void);
 static void MX_TIM3_Init(void);
 static void MX_USART1_UART_Init(void);
+static void MX_IWDG_Init(void);
 /* USER CODE BEGIN PFP */
 int absi(const int i);
 void adc_init();
@@ -308,7 +327,8 @@ void adc_update_bemf()
     else bemf_raw = 0;
     bemf_mv_raw = (int64_t)bemf_raw * AdcVrefMv * 1249 / (vref_raw_ * 249);
   }
-  bemf_mv_ = (bemf_mv_raw * AdcBemfLpfFo + bemf_mv_ * AdcBemfLpf1_Fo) >> AdcBemfLpfQ;
+  bemf_sum_mv_ += bemf_mv_raw;
+  bemf_sum_num_++;
 }
 
 // The shunt only carries current during the on-time, so the drive period mean is divided by the duty.
@@ -413,6 +433,7 @@ void update_params()
 
 void pwm_cb()
 {
+  pwm_cb_cnt_++;
   bemf_meas_cnt_++;
   if (bemf_meas_cnt_ == bemf_meas_end_)
   {
@@ -422,11 +443,34 @@ void pwm_cb()
     if (mode_ != CTRL_VOLT)
     {
       led_on(0);
+      // Averaged within this window only, so it adds no delay across control cycles.
+      bemf_mv_ = bemf_sum_mv_ / bemf_sum_num_;
+      bemf_sum_mv_ = 0;
+      bemf_sum_num_ = 0;
+
+      // The rotor cannot jump in one cycle, so a single far off value is a measurement spike.
+      // Only needed below the knee: the high gain there would turn it into a large output step.
+      if (absi(target_ref_mv_) < GainKneeMv
+          && absi(bemf_mv_ - bemf_prev_mv_) > BemfSpikeMv + absi(target_ref_mv_) && !bemf_held_)
+      {
+        bemf_mv_ = bemf_prev_mv_;
+        bemf_held_ = true;
+      }
+      else
+      {
+        bemf_held_ = false;
+      }
+      bemf_prev_mv_ = bemf_mv_;
+
+      if (target_mv_ > target_ref_mv_ + TargetRampMv) target_ref_mv_ += TargetRampMv;
+      else if (target_mv_ < target_ref_mv_ - TargetRampMv) target_ref_mv_ -= TargetRampMv;
+      else target_ref_mv_ = target_mv_;
+
       // A target that only touches 0 at very low speed must not reset the integrator.
-      if (target_mv_ != 0) zero_target_cycles_ = 0;
+      if (target_ref_mv_ != 0) zero_target_cycles_ = 0;
       else if (zero_target_cycles_ < ZeroHoldEnterCycles) zero_target_cycles_++;
       const bool zero_hold = (zero_target_cycles_ >= ZeroHoldEnterCycles);
-      int32_t err = target_mv_ - bemf_mv_;
+      int32_t err = target_ref_mv_ - bemf_mv_;
       int32_t vout;
       int32_t vout_tmp;
 
@@ -442,17 +486,29 @@ void pwm_cb()
         else err = 0;
       }
 
-      v_i_sum_ += err;
+      // The gain also scales the integral, so rescale it to keep its output across gain changes.
+      const int32_t gain_i_q4 = gain_scheduled_q4_ > IntegralGainMinQ4 ? gain_scheduled_q4_ : IntegralGainMinQ4;
+      if (gain_prev_q4_ != 0 && gain_i_q4 != gain_prev_q4_)
+      {
+        v_i_sum_ = (int64_t)v_i_sum_ * gain_prev_q4_ / gain_i_q4;
+      }
+      gain_prev_q4_ = gain_i_q4;
+
+      // A limit rather than a stop, so a large error from a heavy load still reaches the integral.
+      int32_t i_add = err;
+      if (i_add > IntegralClampMv) i_add = IntegralClampMv;
+      else if (i_add < -IntegralClampMv) i_add = -IntegralClampMv;
+      v_i_sum_ += i_add;
 
       // feedforward
-      vout = (target_mv_ * (p_mt_conf_->v_ff_kp_q8)) >> CtrlQ;
+      vout = (target_ref_mv_ * (p_mt_conf_->v_ff_kp_q8)) >> CtrlQ;
 
       // feedback
-      const int32_t fb = ((int64_t)err * (p_mt_conf_->v_kp_q8)
-                          + (int64_t)v_i_sum_ * (p_mt_conf_->v_ti_q8))
-                          >> CtrlQ;
+      const int32_t fb_p = ((int64_t)err * (p_mt_conf_->v_kp_q8)) >> CtrlQ;
+      const int32_t fb_i = ((int64_t)v_i_sum_ * (p_mt_conf_->v_ti_q8)) >> CtrlQ;
 
-      vout += (fb * gain_scheduled_q4_) >> CtrlGainQ;
+      vout += (fb_p * gain_scheduled_q4_) >> CtrlGainQ;
+      vout += (fb_i * gain_i_q4) >> CtrlGainQ;
 
       // compensate brush voltage drop
       // Skipped at zero target: the step at vout = 0 would flip the output by +-brush_co_mv.
@@ -475,7 +531,7 @@ void pwm_cb()
       if ((vout < vout_tmp && err > 0)
           || (vout > vout_tmp && err < 0))
       {
-        v_i_sum_ -= err;
+        v_i_sum_ -= i_add;
       }
 
       vout_mv_ = vout;
@@ -496,6 +552,45 @@ void pwm_cb()
   else if (bemf_meas_cnt_ == bemf_meas_start_)
   {
     adc_enable_bemf_update();
+  }
+}
+
+static bool parse_mv(const char* s, int32_t* mv)
+{
+  const bool neg = (*s == '-');
+  if (neg) ++s;
+  if (*s == '\0') return false;
+  int32_t val = 0;
+  for (; *s != '\0'; ++s)
+  {
+    if (*s < '0' || *s > '9' || val > 100000) return false;
+    val = val * 10 + (*s - '0');
+  }
+  *mv = neg ? -val : val;
+  return true;
+}
+
+/*
+T<mv> : switch to PC mode and set the target. Must be repeated within PcTargetTimeoutMs.
+K     : switch back to the knob.
+*/
+static void pc_command_poll()
+{
+  char line[16];
+  if (usart_readline(line, sizeof(line)) == 0) return;
+
+  int32_t mv;
+  if (line[0] == 'T' && parse_mv(&line[1], &mv))
+  {
+    if (mv > p_mt_conf_->max_mv) mv = p_mt_conf_->max_mv;
+    else if (mv < -p_mt_conf_->max_mv) mv = -p_mt_conf_->max_mv;
+    pc_target_mv_ = mv;
+    pc_target_ms_ = ms_;
+    pc_mode_ = true;
+  }
+  else if (line[0] == 'K' && line[1] == '\0')
+  {
+    pc_mode_ = false;
   }
 }
 
@@ -552,6 +647,7 @@ int main(void)
   MX_TIM1_Init();
   MX_TIM3_Init();
   MX_USART1_UART_Init();
+  MX_IWDG_Init();
   /* USER CODE BEGIN 2 */
   pwm_init();
   adc_init();
@@ -563,8 +659,16 @@ int main(void)
   adc_set_gain(ADC_GAIN_LOW);
   gain_multiplier_q4_ = (p_mt_conf_->v_gain_schedule_multiplier) << CtrlGainQ;
   gain_scheduled_q4_ = gain_multiplier_q4_;
+
+  uint32_t pwm_cb_cnt_prev = pwm_cb_cnt_;
   while (1)
   {
+    // Refresh only while both the main loop and the control interrupt are running.
+    if (pwm_cb_cnt_ != pwm_cb_cnt_prev)
+    {
+      pwm_cb_cnt_prev = pwm_cb_cnt_;
+      LL_IWDG_ReloadCounter(IWDG);
+    }
     if (sw_is_pressed())
       pwm_disable();
     update_params();
@@ -614,6 +718,14 @@ int main(void)
       if (target > db) target -= db;
       else if (target < -db) target += db;
       else target = 0;
+
+      pc_command_poll();
+      if (pc_mode_)
+      {
+        // Stays in PC mode on timeout: falling back to the knob could start the motor.
+        target = (ms_ - pc_target_ms_ < PcTargetTimeoutMs) ? pc_target_mv_ : 0;
+      }
+
       if (target == 0) led_off(3);
       else led_on(3);
 
@@ -622,7 +734,11 @@ int main(void)
 
       target_mv_ = target;
 
-      gain_scheduled_q4_ = (1<<CtrlGainQ) + gain_multiplier_q4_ * (p_mt_conf_->max_mv - absi(target_mv_))/(p_mt_conf_->max_mv);
+      // High gain only where cogging dominates. Above the knee it just amplifies the BEMF ripple.
+      const int32_t gain_scale = GainKneeMv - absi(target_ref_mv_);
+      const int32_t gain_extra_scale = GainExtraKneeMv - absi(target_ref_mv_);
+      gain_scheduled_q4_ = (1<<CtrlGainQ) + (gain_scale > 0 ? gain_multiplier_q4_ * gain_scale / GainKneeMv : 0)
+                           + (gain_extra_scale > 0 ? (GainExtra << CtrlGainQ) * gain_extra_scale / GainExtraKneeMv : 0);
       #endif
     }
       break;
@@ -656,6 +772,12 @@ void SystemClock_Config(void)
   /* HSI configuration and activation */
   LL_RCC_HSI_Enable();
   while(LL_RCC_HSI_IsReady() != 1)
+  {
+  }
+
+  /* LSI configuration and activation */
+  LL_RCC_LSI_Enable();
+  while(LL_RCC_LSI_IsReady() != 1)
   {
   }
 
@@ -1114,6 +1236,36 @@ static void MX_I2C1_Init(void)
 }
 
 /**
+  * @brief IWDG Initialization Function
+  * @param None
+  * @retval None
+  */
+static void MX_IWDG_Init(void)
+{
+
+  /* USER CODE BEGIN IWDG_Init 0 */
+
+  /* USER CODE END IWDG_Init 0 */
+
+  /* USER CODE BEGIN IWDG_Init 1 */
+
+  /* USER CODE END IWDG_Init 1 */
+  LL_IWDG_Enable(IWDG);
+  LL_IWDG_EnableWriteAccess(IWDG);
+  LL_IWDG_SetPrescaler(IWDG, LL_IWDG_PRESCALER_32);
+  LL_IWDG_SetReloadCounter(IWDG, 200);
+  while (LL_IWDG_IsReady(IWDG) != 1)
+  {
+  }
+
+  LL_IWDG_ReloadCounter(IWDG);
+  /* USER CODE BEGIN IWDG_Init 2 */
+
+  /* USER CODE END IWDG_Init 2 */
+
+}
+
+/**
   * @brief TIM1 Initialization Function
   * @param None
   * @retval None
@@ -1354,6 +1506,7 @@ static void MX_USART1_UART_Init(void)
   LL_USART_SetTXFIFOThreshold(USART1, LL_USART_FIFOTHRESHOLD_1_8);
   LL_USART_SetRXFIFOThreshold(USART1, LL_USART_FIFOTHRESHOLD_1_8);
   LL_USART_DisableFIFO(USART1);
+  LL_USART_DisableOverrunDetect(USART1);
   LL_USART_ConfigAsyncMode(USART1);
 
   /* USER CODE BEGIN WKUPType USART1 */

@@ -5,7 +5,6 @@ static char usart_rx_buf[UART_RX_BUF_LEN];
 static int32_t usart_rx_wp = 0;
 static int32_t usart_rx_rp = 0;
 static int32_t usart_error = 0;
-static int32_t usart_rx_nl = 0;
 static int32_t usart_tx_busy = 0;
 
 void usart_init(void)
@@ -39,54 +38,33 @@ int usart_tx(const char* str, const int len)
   return 0;
 }
 
-void usart_update_nl(void)
-{
-  int nl = 0;
-  char c_prev = '\0';
-  for (uint32_t i = usart_rx_rp; i != usart_rx_wp; i = (i+1) & UART_RX_BUF_MASK)
-  {
-    if (usart_rx_buf[i] == '\n')
-    {
-      if (c_prev != '\r')
-      {
-        nl++;
-      }
-      c_prev = usart_rx_buf[i];
-      usart_rx_buf[i] = '\0';
-    }
-    else if (usart_rx_buf[i] == '\r')
-    {
-      nl++;
-      c_prev = usart_rx_buf[i];
-      usart_rx_buf[i] = '\0';
-    }
-    else
-    {
-      c_prev = usart_rx_buf[i];
-    }
-  }
-  usart_rx_nl = nl;
-}
-
+// Returns the length of the next line. Empty lines and lines too long for str are dropped and return 0.
 int usart_readline(char* str, const int len)
 {
-  usart_update_nl();
-  if (usart_rx_nl == 0)
+  int n = 0;
+  for (int32_t i = usart_rx_rp; i != usart_rx_wp; i = (i + 1) & UART_RX_BUF_MASK)
   {
-    return 0;
-  }
-  char c;
-  for (int i = 0; i < len && usart_rx_rp != usart_rx_wp ; ++i)
-  {
-    c = usart_rx_buf[usart_rx_rp++];
-    usart_rx_rp &= UART_RX_BUF_MASK;
-    str[i] = c;
-    if (c == '\0')
+    const char c = usart_rx_buf[i];
+    if (c == '\n' || c == '\r')
     {
-      break;
+      if (n >= len)
+      {
+        n = 0;
+      }
+      for (int j = 0; j < n; ++j)
+      {
+        str[j] = usart_rx_buf[(usart_rx_rp + j) & UART_RX_BUF_MASK];
+      }
+      if (n > 0)
+      {
+        str[n] = '\0';
+      }
+      usart_rx_rp = (i + 1) & UART_RX_BUF_MASK;
+      return n;
     }
+    ++n;
   }
-  return len;
+  return 0;
 }
 
 inline bool usart_is_tx_busy(void)
@@ -100,7 +78,7 @@ void usart_rx_cb(void)
   usart_rx_wp = (usart_rx_wp + 1) & UART_RX_BUF_MASK;
   if (usart_rx_wp == usart_rx_rp)
   {
-    ++usart_rx_rp;
+    usart_rx_rp = (usart_rx_rp + 1) & UART_RX_BUF_MASK;
     usart_error |= 0x0001;
   }
 }

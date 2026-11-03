@@ -4,6 +4,5 @@
 
 void usart_init(void);
 int usart_tx(const char* str, const int len);
-void usart_update_nl(void);
 int usart_readline(char* str, const int len);
 bool usart_is_tx_busy(void);
