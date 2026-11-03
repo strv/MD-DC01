@@ -31,6 +31,7 @@ extern "C" {
 #include "stm32g0xx_ll_dac.h"
 #include "stm32g0xx_ll_dma.h"
 #include "stm32g0xx_ll_i2c.h"
+#include "stm32g0xx_ll_iwdg.h"
 #include "stm32g0xx_ll_rcc.h"
 #include "stm32g0xx_ll_bus.h"
 #include "stm32g0xx_ll_system.h"
